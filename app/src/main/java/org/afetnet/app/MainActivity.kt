@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.provider.Settings
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -59,8 +60,6 @@ class MainActivity : ComponentActivity() {
     private val messageQueue = mutableStateListOf<String>()
     private var serverIp = mutableStateOf("192.168.1.100")
     private var currentLocation = mutableStateOf<Pair<Double, Double>?>(null)
-    
-    // Çökme yerine ekranda hata göstermek için
     private var systemError = mutableStateOf<String?>(null)
 
     private val permissionLauncher = registerForActivityResult(
@@ -78,7 +77,6 @@ class MainActivity : ComponentActivity() {
             initCrypto()
         } catch (e: Exception) {
             systemError.value = "Şifreleme Motoru Hatası: ${e.message}"
-            // Fallback: Rastgele geçersiz ama çökmeyen anahtar
             secretKey = SecretKeySpec(ByteArray(32), "AES")
             myDid = "did:afet:fallback"
         }
@@ -86,7 +84,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFD32F2F), background = Color(0xFF0A0A0A))) {
                 if (systemError.value != null) {
-                    // HATA EKRANI
                     Box(modifier = Modifier.fillMaxSize().background(Color.Black).padding(24.dp), contentAlignment = Alignment.Center) {
                         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF400000))) {
                             Column(modifier = Modifier.padding(24.dp)) {
@@ -99,7 +96,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 } else {
-                    // NORMAL EKRAN
                     AfetNetProApp(
                         logs = logs, 
                         myDid = myDid, 
@@ -120,11 +116,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initCrypto() {
+        val alias = "afetnet_key_v2"
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        if (!ks.containsAlias("afetnet_key")) {
+        
+        // 1. Anahtarı KeyStore'dan al veya üret
+        if (!ks.containsAlias(alias)) {
             val kg = KeyGenerator.getInstance("AES", "AndroidKeyStore")
             kg.init(android.security.keystore.KeyGenParameterSpec.Builder(
-                "afetnet_key",
+                alias,
                 android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
@@ -133,10 +132,24 @@ class MainActivity : ComponentActivity() {
                 .build())
             kg.generateKey()
         }
-        val entry = ks.getEntry("afetnet_key", null) as KeyStore.SecretKeyEntry
+        
+        val entry = ks.getEntry(alias, null) as KeyStore.SecretKeyEntry
         secretKey = entry.secretKey
+        
+        // 2. DID'yi anahtar içeriğinden DEĞİL, alias + cihaz ID'sinden üret
+        // Modern Android cihazlar secretKey.encoded'i null döndürür (donanım destekli güvenlik).
+        // Bu yüzden deterministik DID için alias + Android ID kombinasyonunu hash'liyoruz.
+        val androidId = try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+        } catch (e: Exception) {
+            "unknown"
+        }
+        
+        val didSeed = "$alias::$androidId"
         myDid = "did:afet:" + MessageDigest.getInstance("SHA-256")
-            .digest(secretKey.encoded).joinToString("") { "%02x".format(it) }.take(12)
+            .digest(didSeed.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(16)
     }
 
     private fun checkPermissions() {
@@ -182,7 +195,7 @@ class MainActivity : ComponentActivity() {
     private fun startMesh() {
         try {
             val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-            connectionsClient.startAdvertising("AfetNet-$myDid", serviceId, connectionLifecycleCallback, options)
+            connectionsClient.startAdvertising("AfetNet-${myDid.take(6)}", serviceId, connectionLifecycleCallback, options)
             connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build())
             addLog("📡 Mesh Ağı Aktif")
         } catch (e: Exception) {
@@ -203,7 +216,7 @@ class MainActivity : ComponentActivity() {
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             discoveredEndpoints[endpointId] = info.endpointName
-            connectionsClient.requestConnection("AfetNet-$myDid", endpointId, connectionLifecycleCallback)
+            connectionsClient.requestConnection("AfetNet-${myDid.take(6)}", endpointId, connectionLifecycleCallback)
         }
         override fun onEndpointLost(endpointId: String) { discoveredEndpoints.remove(endpointId) }
     }
@@ -410,7 +423,7 @@ fun NetworkScreen(logs: List<String>, queueSize: Int) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text("Mesh Ağ Durumu", color = Color.White, fontWeight = FontWeight.Bold)
                 Text("Kuyrukta Bekleyen Paket: $queueSize", color = Color.Yellow)
-                Text("Şifreleme: AES-256-GCM (Aktif)", color = Color.Green, fontSize = 12.sp)
+                Text("Şifreleme: AES-256-GCM (Donanım Destekli)", color = Color.Green, fontSize = 12.sp)
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -442,6 +455,6 @@ fun SettingsScreen(ip: String, onIpChange: (String) -> Unit) {
         Text("Bilgisayarınızın yerel IP'sini girin (Örn: 192.168.1.34)", color = Color.Gray, fontSize = 12.sp)
         Spacer(Modifier.height(32.dp))
         Text("Hakkında", color = Color.White, fontWeight = FontWeight.Bold)
-        Text("Afet-Net Professional v1.0\nMerkeziyetsiz, Uçtan Uca Şifreli, Yapay Zeka Destekli Afet Haberleşme Ağı.", color = Color.LightGray, fontSize = 14.sp)
+        Text("Afet-Net Professional v1.1\nMerkeziyetsiz, Donanım Destekli Şifreleme, Yapay Zeka Destekli Afet Haberleşme Ağı.", color = Color.LightGray, fontSize = 14.sp)
     }
 }
