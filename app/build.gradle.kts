@@ -38,10 +38,11 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
-    implementation("com.google.android.gms:play-services-nearby:19.1.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("androidx.compose.foundation:foundation")
     
-    // Yeni: QR Kod ve Profesyonel İzinler
-    implementation("com.google.zxing:core:3.5.3")
-    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // Nearby (Mesh) ve Location (GPS) Kütüphaneleri
+    implementation("com.google.android.gms:play-services-nearby:19.1.0")
+    implementation("com.google.android.gms:play-services-location:21.1.0")
+    
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
