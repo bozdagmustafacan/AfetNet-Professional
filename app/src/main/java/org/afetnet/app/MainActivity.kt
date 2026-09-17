@@ -3,6 +3,8 @@ package org.afetnet.app
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
@@ -28,14 +30,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
+import com.google.android.gms.location.*
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -48,6 +46,7 @@ import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.spec.SecretKeySpec
 
 class MainActivity : ComponentActivity() {
     private lateinit var connectionsClient: ConnectionsClient
@@ -60,17 +59,67 @@ class MainActivity : ComponentActivity() {
     private val messageQueue = mutableStateListOf<String>()
     private var serverIp = mutableStateOf("192.168.1.100")
     private var currentLocation = mutableStateOf<Pair<Double, Double>?>(null)
+    
+    // Çökme yerine ekranda hata göstermek için
+    private var systemError = mutableStateOf<String?>(null)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions.values.all { it }) initSystem()
+        else systemError.value = "Gerekli izinler (Konum, Bluetooth) verilmedi. Uygulama çalışamaz."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         connectionsClient = Nearby.getConnectionsClient(this)
         
+        try {
+            initCrypto()
+        } catch (e: Exception) {
+            systemError.value = "Şifreleme Motoru Hatası: ${e.message}"
+            // Fallback: Rastgele geçersiz ama çökmeyen anahtar
+            secretKey = SecretKeySpec(ByteArray(32), "AES")
+            myDid = "did:afet:fallback"
+        }
+
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFD32F2F), background = Color(0xFF0A0A0A))) {
+                if (systemError.value != null) {
+                    // HATA EKRANI
+                    Box(modifier = Modifier.fillMaxSize().background(Color.Black).padding(24.dp), contentAlignment = Alignment.Center) {
+                        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF400000))) {
+                            Column(modifier = Modifier.padding(24.dp)) {
+                                Text("⚠️ SİSTEM HATASI", color = Color.Red, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                                Spacer(Modifier.height(16.dp))
+                                Text(systemError.value ?: "", color = Color.White)
+                                Spacer(Modifier.height(16.dp))
+                                Text("Lütfen bu mesajdaki hatayı bana iletin.", color = Color.Gray, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                } else {
+                    // NORMAL EKRAN
+                    AfetNetProApp(
+                        logs = logs, 
+                        myDid = myDid, 
+                        onEmergency = { note, needs -> sendEmergency(note, needs) },
+                        serverIp = serverIp,
+                        onIpChange = { serverIp.value = it },
+                        queueSize = messageQueue.size
+                    )
+                }
+            }
+        }
+        
+        try {
+            checkPermissions()
+        } catch (e: Exception) {
+            systemError.value = "İzin Kontrol Hatası: ${e.message}"
+        }
+    }
+
+    private fun initCrypto() {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (!ks.containsAlias("afetnet_key")) {
             val kg = KeyGenerator.getInstance("AES", "AndroidKeyStore")
@@ -88,20 +137,6 @@ class MainActivity : ComponentActivity() {
         secretKey = entry.secretKey
         myDid = "did:afet:" + MessageDigest.getInstance("SHA-256")
             .digest(secretKey.encoded).joinToString("") { "%02x".format(it) }.take(12)
-
-        setContent {
-            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFFD32F2F), background = Color(0xFF0A0A0A))) {
-                AfetNetProApp(
-                    logs = logs, 
-                    myDid = myDid, 
-                    onEmergency = { note, needs -> sendEmergency(note, needs) },
-                    serverIp = serverIp,
-                    onIpChange = { serverIp.value = it },
-                    queueSize = messageQueue.size
-                )
-            }
-        }
-        checkPermissions()
     }
 
     private fun checkPermissions() {
@@ -120,15 +155,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initSystem() {
-        addLog("🛡️ DID Kimliği Oluşturuldu: $myDid")
+        addLog("🛡️ DID Kimliği Aktif: $myDid")
         startLocationTracking()
         startMesh()
     }
 
     private fun startLocationTracking() {
-        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_LOW_POWER, 10000).build()
         try {
+            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_LOW_POWER, 10000).build()
             fusedLocationClient.requestLocationUpdates(locationRequest, object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
                     result.lastLocation?.let {
@@ -136,16 +171,23 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }, Looper.getMainLooper())
+            addLog("📍 Konum servisi başlatıldı")
         } catch (e: SecurityException) {
-            addLog("⚠️ Konum izni hatası")
+            addLog("⚠️ Konum izni reddedildi (Varsayılan koordinat kullanılacak)")
+        } catch (e: Exception) {
+            addLog("⚠️ Konum servisi hatası: ${e.message}")
         }
     }
 
     private fun startMesh() {
-        val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        connectionsClient.startAdvertising("AfetNet-$myDid", serviceId, connectionLifecycleCallback, options)
-        connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build())
-        addLog("📡 Mesh Ağı Aktif (Radyolar Dinleniyor...)")
+        try {
+            val options = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+            connectionsClient.startAdvertising("AfetNet-$myDid", serviceId, connectionLifecycleCallback, options)
+            connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build())
+            addLog("📡 Mesh Ağı Aktif")
+        } catch (e: Exception) {
+            addLog("❌ Mesh başlatılamadı: ${e.message}")
+        }
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
@@ -153,7 +195,7 @@ class MainActivity : ComponentActivity() {
             connectionsClient.acceptConnection(endpointId, payloadCallback)
         }
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
-            if (result.status.isSuccess) addLog("🔗 Düğüm Bağlandı: $endpointId")
+            if (result.status.isSuccess) addLog("🔗 Düğüm Bağlandı")
         }
         override fun onDisconnected(endpointId: String) { discoveredEndpoints.remove(endpointId) }
     }
@@ -178,69 +220,81 @@ class MainActivity : ComponentActivity() {
                 tryUplinkToServer()
             }
         }
-        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Zorunlu boş implementasyon
-        }
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
     }
 
     private fun sendEmergency(note: String, needs: List<String>) {
-        val loc = currentLocation.value
-        val json = JSONObject().apply {
-            put("did", myDid)
-            put("note", note)
-            put("needs", needs)
-            put("lat", loc?.first ?: 39.9208)
-            put("lng", loc?.second ?: 32.8541)
-            put("ts", System.currentTimeMillis())
+        try {
+            val loc = currentLocation.value
+            val json = JSONObject().apply {
+                put("did", myDid)
+                put("note", note)
+                put("needs", needs)
+                put("lat", loc?.first ?: 39.9208)
+                put("lng", loc?.second ?: 32.8541)
+                put("ts", System.currentTimeMillis())
+            }
+            
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val encrypted = cipher.doFinal(json.toString().toByteArray())
+            val iv = cipher.iv
+            
+            val payloadObj = JSONObject().apply {
+                put("iv", Base64.encodeToString(iv, Base64.DEFAULT))
+                put("data", Base64.encodeToString(encrypted, Base64.DEFAULT))
+                put("sender", myDid)
+            }
+            
+            val payloadStr = payloadObj.toString()
+            val payload = Payload.fromBytes(payloadStr.toByteArray())
+            
+            if (discoveredEndpoints.isEmpty()) {
+                addLog("⚠️ Yakında cihaz yok. Paket kuyruğa alındı.")
+            } else {
+                connectionsClient.sendPayload(discoveredEndpoints.keys.toList(), payload)
+                addLog("🚀 Şifreli SOS Yayınlandı")
+            }
+            messageQueue.add(payloadStr)
+            tryUplinkToServer()
+        } catch (e: Exception) {
+            addLog("❌ Mesaj gönderilemedi: ${e.message}")
         }
-        
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-        val encrypted = cipher.doFinal(json.toString().toByteArray())
-        val iv = cipher.iv
-        
-        val payloadObj = JSONObject().apply {
-            put("iv", Base64.encodeToString(iv, Base64.DEFAULT))
-            put("data", Base64.encodeToString(encrypted, Base64.DEFAULT))
-            put("sender", myDid)
-        }
-        
-        val payloadStr = payloadObj.toString()
-        val payload = Payload.fromBytes(payloadStr.toByteArray())
-        
-        if (discoveredEndpoints.isEmpty()) {
-            addLog("⚠️ Yakında cihaz yok. Paket kuyruğa alındı.")
-        } else {
-            connectionsClient.sendPayload(discoveredEndpoints.keys.toList(), payload)
-            addLog("🚀 Şifreli SOS Yayınlandı")
-        }
-        messageQueue.add(payloadStr)
-        tryUplinkToServer()
     }
 
     private fun tryUplinkToServer() {
         if (messageQueue.isEmpty()) return
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val netInfo = cm.activeNetworkInfo
-        if (netInfo != null && netInfo.isConnected) {
-            val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO)
-            scope.launch {
-                if (messageQueue.isEmpty()) return@launch
-                val msg = messageQueue.removeAt(0)
-                try {
-                    val url = URL("http://${serverIp.value}:8000/api/ingest")
-                    val conn = url.openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.doOutput = true
-                    OutputStreamWriter(conn.outputStream).use { it.write(msg) }
-                    if (conn.responseCode == 200) {
-                        withContext(Dispatchers.Main) { addLog("🛰️ Sunucuya Aktarıldı") }
+        
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val network = cm.activeNetwork ?: return
+            val capabilities = cm.getNetworkCapabilities(network) ?: return
+            val isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            
+            if (isConnected) {
+                val scope = CoroutineScope(Dispatchers.IO)
+                scope.launch {
+                    if (messageQueue.isEmpty()) return@launch
+                    val msg = messageQueue.removeAt(0)
+                    try {
+                        val url = URL("http://${serverIp.value}:8000/api/ingest")
+                        val conn = url.openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        conn.connectTimeout = 3000
+                        conn.readTimeout = 3000
+                        conn.doOutput = true
+                        OutputStreamWriter(conn.outputStream).use { it.write(msg) }
+                        if (conn.responseCode == 200) {
+                            withContext(Dispatchers.Main) { addLog("🛰️ Sunucuya Aktarıldı") }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) { addLog("❌ Sunucu Hatası: ${e.message?.take(30)}") }
                     }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) { addLog("❌ Sunucu Hatası") }
                 }
             }
+        } catch (e: Exception) {
+            // Ağ kontrolü hatası
         }
     }
 
@@ -342,7 +396,7 @@ fun EmergencyScreen(note: String, onNoteChange: (String) -> Unit, needs: List<St
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Filled.Sos, contentDescription = null, tint = Color.White, modifier = Modifier.size(48.dp))
+                Icon(Icons.Filled.Warning, contentDescription = null, tint = Color.White, modifier = Modifier.size(48.dp))
                 Text("GÜVENDE DEĞİLİM", fontSize = 28.sp, fontWeight = FontWeight.Black, color = Color.White)
             }
         }
