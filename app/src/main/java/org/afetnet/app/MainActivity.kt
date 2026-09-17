@@ -42,43 +42,49 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.security.KeyStore
 import java.security.MessageDigest
+import java.util.UUID
 import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        // AFAD Komuta Merkezi ile paylaşılan ana anahtar tohumu.
+        // Gerçek sistemde bu, AFAD'ın RSA public key'i ile değiştirilir.
+        const val MASTER_KEY_SEED = "AFETNET-AFAD-MASTER-KEY-V1"
+    }
+
     private lateinit var connectionsClient: ConnectionsClient
     private val serviceId = "org.afetnet.mesh.v2"
     private lateinit var myDid: String
-    private lateinit var secretKey: SecretKey
-    
+    private lateinit var afadKey: SecretKey
+
     private val logs = mutableStateListOf<String>()
     private val discoveredEndpoints = mutableStateMapOf<String, String>()
     private val messageQueue = mutableStateListOf<String>()
+    private val seenIds = mutableSetOf<String>()
     private var serverIp = mutableStateOf("192.168.1.100")
     private var currentLocation = mutableStateOf<Pair<Double, Double>?>(null)
+    private var locationText = mutableStateOf("📍 Konum bekleniyor...")
     private var systemError = mutableStateOf<String?>(null)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions.values.all { it }) initSystem()
-        else systemError.value = "Gerekli izinler (Konum, Bluetooth) verilmedi. Uygulama çalışamaz."
+        else systemError.value = "Gerekli izinler (Konum, Bluetooth) verilmedi."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         connectionsClient = Nearby.getConnectionsClient(this)
-        
+
         try {
-            initCrypto()
+            initIdentity()
         } catch (e: Exception) {
-            systemError.value = "Şifreleme Motoru Hatası: ${e.message}"
-            secretKey = SecretKeySpec(ByteArray(32), "AES")
-            myDid = "did:afet:fallback"
+            systemError.value = "Kimlik hatası: ${e.message}"
         }
 
         setContent {
@@ -90,15 +96,14 @@ class MainActivity : ComponentActivity() {
                                 Text("⚠️ SİSTEM HATASI", color = Color.Red, fontWeight = FontWeight.Bold, fontSize = 20.sp)
                                 Spacer(Modifier.height(16.dp))
                                 Text(systemError.value ?: "", color = Color.White)
-                                Spacer(Modifier.height(16.dp))
-                                Text("Lütfen bu mesajdaki hatayı bana iletin.", color = Color.Gray, fontSize = 12.sp)
                             }
                         }
                     }
                 } else {
                     AfetNetProApp(
-                        logs = logs, 
-                        myDid = myDid, 
+                        logs = logs,
+                        myDid = myDid,
+                        locationText = locationText.value,
                         onEmergency = { note, needs -> sendEmergency(note, needs) },
                         serverIp = serverIp,
                         onIpChange = { serverIp.value = it },
@@ -107,49 +112,27 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        
+
         try {
             checkPermissions()
         } catch (e: Exception) {
-            systemError.value = "İzin Kontrol Hatası: ${e.message}"
+            systemError.value = "İzin kontrol hatası: ${e.message}"
         }
     }
 
-    private fun initCrypto() {
-        val alias = "afetnet_key_v2"
-        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        
-        // 1. Anahtarı KeyStore'dan al veya üret
-        if (!ks.containsAlias(alias)) {
-            val kg = KeyGenerator.getInstance("AES", "AndroidKeyStore")
-            kg.init(android.security.keystore.KeyGenParameterSpec.Builder(
-                alias,
-                android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT
-            )
-                .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .build())
-            kg.generateKey()
-        }
-        
-        val entry = ks.getEntry(alias, null) as KeyStore.SecretKeyEntry
-        secretKey = entry.secretKey
-        
-        // 2. DID'yi anahtar içeriğinden DEĞİL, alias + cihaz ID'sinden üret
-        // Modern Android cihazlar secretKey.encoded'i null döndürür (donanım destekli güvenlik).
-        // Bu yüzden deterministik DID için alias + Android ID kombinasyonunu hash'liyoruz.
+    private fun initIdentity() {
         val androidId = try {
             Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
-        } catch (e: Exception) {
-            "unknown"
-        }
-        
-        val didSeed = "$alias::$androidId"
+        } catch (e: Exception) { "unknown" }
+
         myDid = "did:afet:" + MessageDigest.getInstance("SHA-256")
-            .digest(didSeed.toByteArray(Charsets.UTF_8))
+            .digest(("afetnet::$androidId").toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
             .take(16)
+
+        val keyBytes = MessageDigest.getInstance("SHA-256")
+            .digest(MASTER_KEY_SEED.toByteArray(Charsets.UTF_8))
+        afadKey = SecretKeySpec(keyBytes, "AES")
     }
 
     private fun checkPermissions() {
@@ -168,27 +151,39 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initSystem() {
-        addLog("🛡️ DID Kimliği Aktif: $myDid")
+        addLog("🛡️ DID Aktif: $myDid")
         startLocationTracking()
         startMesh()
     }
 
     private fun startLocationTracking() {
         try {
-            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_LOW_POWER, 10000).build()
-            fusedLocationClient.requestLocationUpdates(locationRequest, object : LocationCallback() {
+            val client = LocationServices.getFusedLocationProviderClient(this)
+
+            // 1) Hemen "son bilinen konumu" çek (beklemeyi önler)
+            client.lastLocation.addOnSuccessListener { loc ->
+                if (loc != null) {
+                    currentLocation.value = Pair(loc.latitude, loc.longitude)
+                    locationText.value = "📍 %.4f, %.4f".format(loc.latitude, loc.longitude)
+                    addLog("📍 Son bilinen konum alındı")
+                }
+            }
+
+            // 2) Sürekli güncel konum takibi
+            val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000).build()
+            client.requestLocationUpdates(req, object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
                     result.lastLocation?.let {
                         currentLocation.value = Pair(it.latitude, it.longitude)
+                        locationText.value = "📍 %.4f, %.4f".format(it.latitude, it.longitude)
                     }
                 }
             }, Looper.getMainLooper())
             addLog("📍 Konum servisi başlatıldı")
         } catch (e: SecurityException) {
-            addLog("⚠️ Konum izni reddedildi (Varsayılan koordinat kullanılacak)")
+            addLog("⚠️ Konum izni yok")
         } catch (e: Exception) {
-            addLog("⚠️ Konum servisi hatası: ${e.message}")
+            addLog("⚠️ Konum hatası: ${e.message}")
         }
     }
 
@@ -199,7 +194,7 @@ class MainActivity : ComponentActivity() {
             connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build())
             addLog("📡 Mesh Ağı Aktif")
         } catch (e: Exception) {
-            addLog("❌ Mesh başlatılamadı: ${e.message}")
+            addLog("❌ Mesh hatası: ${e.message}")
         }
     }
 
@@ -223,14 +218,24 @@ class MainActivity : ComponentActivity() {
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            if (payload.type == Payload.Type.BYTES) {
-                val rawMsg = String(payload.asBytes()!!)
-                addLog("📩 Şifreli Paket Alındı")
-                discoveredEndpoints.keys.filter { it != endpointId }.forEach { otherId ->
-                    connectionsClient.sendPayload(otherId, Payload.fromBytes(rawMsg.toByteArray()))
+            if (payload.type != Payload.Type.BYTES) return
+            val str = String(payload.asBytes()!!)
+            try {
+                val env = JSONObject(str)
+                val id = env.optString("id")
+                if (id.isEmpty() || !seenIds.add(id)) {
+                    addLog("🔁 Bilinen paket, yoksayıldı")
+                    return
                 }
-                messageQueue.add(rawMsg)
+                addLog("📩 Şifreli AFAD paketi alındı (içerik okunamaz)")
+                // Store-and-forward: diğer düğümlere ilet
+                discoveredEndpoints.keys.filter { it != endpointId }.forEach {
+                    connectionsClient.sendPayload(it, Payload.fromBytes(str.toByteArray()))
+                }
+                messageQueue.add(str)
                 tryUplinkToServer()
+            } catch (e: Exception) {
+                addLog("⚠️ Bozuk paket yoksayıldı")
             }
         }
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
@@ -239,76 +244,75 @@ class MainActivity : ComponentActivity() {
     private fun sendEmergency(note: String, needs: List<String>) {
         try {
             val loc = currentLocation.value
-            val json = JSONObject().apply {
+            if (loc == null) addLog("⚠️ GPS kilidi yok, konum boş gönderilecek")
+
+            val inner = JSONObject().apply {
                 put("did", myDid)
                 put("note", note)
                 put("needs", needs)
-                put("lat", loc?.first ?: 39.9208)
-                put("lng", loc?.second ?: 32.8541)
+                if (loc != null) { put("lat", loc.first); put("lng", loc.second) }
                 put("ts", System.currentTimeMillis())
             }
-            
+
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-            val encrypted = cipher.doFinal(json.toString().toByteArray())
-            val iv = cipher.iv
-            
-            val payloadObj = JSONObject().apply {
-                put("iv", Base64.encodeToString(iv, Base64.DEFAULT))
-                put("data", Base64.encodeToString(encrypted, Base64.DEFAULT))
+            cipher.init(Cipher.ENCRYPT_MODE, afadKey)
+            val ct = cipher.doFinal(inner.toString().toByteArray(Charsets.UTF_8))
+
+            val envelope = JSONObject().apply {
+                put("v", 2)
+                put("id", UUID.randomUUID().toString())
                 put("sender", myDid)
+                put("recipient", "did:afet:afad")
+                put("kind", "EMERGENCY")
+                put("ts", System.currentTimeMillis())
+                put("iv", Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+                put("ct", Base64.encodeToString(ct, Base64.NO_WRAP))
             }
-            
-            val payloadStr = payloadObj.toString()
-            val payload = Payload.fromBytes(payloadStr.toByteArray())
-            
+
+            val str = envelope.toString()
+            seenIds.add(envelope.getString("id"))
+
             if (discoveredEndpoints.isEmpty()) {
-                addLog("⚠️ Yakında cihaz yok. Paket kuyruğa alındı.")
+                addLog("⚠️ Yakında cihaz yok, paket kuyruğa alındı")
             } else {
-                connectionsClient.sendPayload(discoveredEndpoints.keys.toList(), payload)
-                addLog("🚀 Şifreli SOS Yayınlandı")
+                connectionsClient.sendPayload(discoveredEndpoints.keys.toList(), Payload.fromBytes(str.toByteArray()))
+                addLog("🚀 Şifreli SOS yayınlandı (${discoveredEndpoints.size} düğüm)")
             }
-            messageQueue.add(payloadStr)
+            messageQueue.add(str)
             tryUplinkToServer()
         } catch (e: Exception) {
-            addLog("❌ Mesaj gönderilemedi: ${e.message}")
+            addLog("❌ Gönderim hatası: ${e.message}")
         }
     }
 
     private fun tryUplinkToServer() {
         if (messageQueue.isEmpty()) return
-        
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val network = cm.activeNetwork ?: return
-            val capabilities = cm.getNetworkCapabilities(network) ?: return
-            val isConnected = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            
-            if (isConnected) {
-                val scope = CoroutineScope(Dispatchers.IO)
-                scope.launch {
-                    if (messageQueue.isEmpty()) return@launch
-                    val msg = messageQueue.removeAt(0)
-                    try {
-                        val url = URL("http://${serverIp.value}:8000/api/ingest")
-                        val conn = url.openConnection() as HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.setRequestProperty("Content-Type", "application/json")
-                        conn.connectTimeout = 3000
-                        conn.readTimeout = 3000
-                        conn.doOutput = true
-                        OutputStreamWriter(conn.outputStream).use { it.write(msg) }
-                        if (conn.responseCode == 200) {
-                            withContext(Dispatchers.Main) { addLog("🛰️ Sunucuya Aktarıldı") }
-                        }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) { addLog("❌ Sunucu Hatası: ${e.message?.take(30)}") }
+            val caps = cm.getNetworkCapabilities(network) ?: return
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
+
+            CoroutineScope(Dispatchers.IO).launch {
+                if (messageQueue.isEmpty()) return@launch
+                val msg = messageQueue.removeAt(0)
+                try {
+                    val url = URL("http://${serverIp.value}:8000/api/ingest")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.connectTimeout = 3000
+                    conn.readTimeout = 3000
+                    conn.doOutput = true
+                    OutputStreamWriter(conn.outputStream).use { it.write(msg) }
+                    if (conn.responseCode == 200) {
+                        withContext(Dispatchers.Main) { addLog("🛰️ Komuta Merkezine aktarıldı") }
                     }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) { addLog("❌ Sunucu hatası: ${e.message?.take(40)}") }
                 }
             }
-        } catch (e: Exception) {
-            // Ağ kontrolü hatası
-        }
+        } catch (e: Exception) { }
     }
 
     private fun addLog(msg: String) {
@@ -322,8 +326,9 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AfetNetProApp(
-    logs: List<String>, 
-    myDid: String, 
+    logs: List<String>,
+    myDid: String,
+    locationText: String,
     onEmergency: (String, List<String>) -> Unit,
     serverIp: MutableState<String>,
     onIpChange: (String) -> Unit,
@@ -344,10 +349,7 @@ fun AfetNetProApp(
                         label = { Text(title, fontSize = 10.sp) },
                         selected = currentTab == index,
                         onClick = { currentTab = index },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Color.Red,
-                            unselectedIconColor = Color.Gray
-                        )
+                        colors = NavigationBarItemDefaults.colors(selectedIconColor = Color.Red, unselectedIconColor = Color.Gray)
                     )
                 }
             }
@@ -355,7 +357,7 @@ fun AfetNetProApp(
     ) { padding ->
         Box(modifier = Modifier.padding(padding).fillMaxSize().background(Color(0xFF0A0A0A))) {
             when (currentTab) {
-                0 -> EmergencyScreen(note, { note = it }, needsOptions, selectedNeeds, { selectedNeeds = it }, onEmergency, myDid)
+                0 -> EmergencyScreen(note, { note = it }, needsOptions, selectedNeeds, { selectedNeeds = it }, onEmergency, myDid, locationText)
                 1 -> NetworkScreen(logs, queueSize)
                 2 -> SettingsScreen(serverIp.value, onIpChange)
             }
@@ -364,10 +366,11 @@ fun AfetNetProApp(
 }
 
 @Composable
-fun EmergencyScreen(note: String, onNoteChange: (String) -> Unit, needs: List<String>, selected: Set<String>, onNeedToggle: (Set<String>) -> Unit, onSend: (String, List<String>) -> Unit, did: String) {
+fun EmergencyScreen(note: String, onNoteChange: (String) -> Unit, needs: List<String>, selected: Set<String>, onNeedToggle: (Set<String>) -> Unit, onSend: (String, List<String>) -> Unit, did: String, locationText: String) {
     Column(modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState())) {
         Text("ACİL DURUM MODU", color = Color.Red, fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Text("Kimlik: $did", color = Color.Gray, fontSize = 12.sp)
+        Text(locationText, color = Color.Green, fontSize = 12.sp)
         Spacer(Modifier.height(24.dp))
 
         Text("İhtiyaç Durumu Seçin:", color = Color.White)
@@ -423,19 +426,14 @@ fun NetworkScreen(logs: List<String>, queueSize: Int) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text("Mesh Ağ Durumu", color = Color.White, fontWeight = FontWeight.Bold)
                 Text("Kuyrukta Bekleyen Paket: $queueSize", color = Color.Yellow)
-                Text("Şifreleme: AES-256-GCM (Donanım Destekli)", color = Color.Green, fontSize = 12.sp)
+                Text("Şifreleme: AES-256-GCM (AFAD Ana Anahtarı)", color = Color.Green, fontSize = 12.sp)
             }
         }
         Spacer(Modifier.height(16.dp))
         Text("Sistem Günlüğü", color = Color.White, fontWeight = FontWeight.Bold)
         LazyColumn(modifier = Modifier.fillMaxWidth()) {
             items(logs) { log ->
-                Text(
-                    text = "• $log",
-                    color = if (log.contains("🚀") || log.contains("🛰️")) Color.Green else Color.LightGray,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                )
+                Text(text = "• $log", color = if (log.contains("🚀") || log.contains("🛰️")) Color.Green else Color.LightGray, fontSize = 12.sp, modifier = Modifier.padding(vertical = 4.dp))
             }
         }
     }
@@ -454,7 +452,6 @@ fun SettingsScreen(ip: String, onIpChange: (String) -> Unit) {
         )
         Text("Bilgisayarınızın yerel IP'sini girin (Örn: 192.168.1.34)", color = Color.Gray, fontSize = 12.sp)
         Spacer(Modifier.height(32.dp))
-        Text("Hakkında", color = Color.White, fontWeight = FontWeight.Bold)
-        Text("Afet-Net Professional v1.1\nMerkeziyetsiz, Donanım Destekli Şifreleme, Yapay Zeka Destekli Afet Haberleşme Ağı.", color = Color.LightGray, fontSize = 14.sp)
+        Text("Afet-Net Professional v1.2", color = Color.LightGray, fontSize = 14.sp)
     }
 }
