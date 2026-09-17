@@ -3,22 +3,20 @@ package org.afetnet.app
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.location.LocationManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
-import android.util.Log
-import android.widget.Toast
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -26,12 +24,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -48,13 +45,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.KeyStore
 import java.security.MessageDigest
-import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
-import android.util.Base64
 
 class MainActivity : ComponentActivity() {
     private lateinit var connectionsClient: ConnectionsClient
@@ -64,8 +57,8 @@ class MainActivity : ComponentActivity() {
     
     private val logs = mutableStateListOf<String>()
     private val discoveredEndpoints = mutableStateMapOf<String, String>()
-    private val messageQueue = mutableStateListOf<String>() // İnternet bulunca gidecekler
-    private var serverIp = mutableStateOf("192.168.1.100") // Python sunucusu IP'si
+    private val messageQueue = mutableStateListOf<String>()
+    private var serverIp = mutableStateOf("192.168.1.100")
     private var currentLocation = mutableStateOf<Pair<Double, Double>?>(null)
 
     private val permissionLauncher = registerForActivityResult(
@@ -78,7 +71,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         connectionsClient = Nearby.getConnectionsClient(this)
         
-        // Kriptografik Kimlik (DID) Üretimi
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         if (!ks.containsAlias("afetnet_key")) {
             val kg = KeyGenerator.getInstance("AES", "AndroidKeyStore")
@@ -178,15 +170,16 @@ class MainActivity : ComponentActivity() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             if (payload.type == Payload.Type.BYTES) {
                 val rawMsg = String(payload.asBytes()!!)
-                addLog("📩 Şifreli Paket Alındı (Boyut: ${rawMsg.length} byte)")
-                // Mesh Relay: Paketi diğerlerine ilet (TTL mantığı basitleştirildi)
+                addLog("📩 Şifreli Paket Alındı")
                 discoveredEndpoints.keys.filter { it != endpointId }.forEach { otherId ->
                     connectionsClient.sendPayload(otherId, Payload.fromBytes(rawMsg.toByteArray()))
                 }
-                // İnternet varsa Python Sunucusuna Uplink
                 messageQueue.add(rawMsg)
                 tryUplinkToServer()
             }
+        }
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            // Zorunlu boş implementasyon
         }
     }
 
@@ -196,12 +189,11 @@ class MainActivity : ComponentActivity() {
             put("did", myDid)
             put("note", note)
             put("needs", needs)
-            put("lat", loc?.first ?: 0.0)
-            put("lng", loc?.second ?: 0.0)
+            put("lat", loc?.first ?: 39.9208)
+            put("lng", loc?.second ?: 32.8541)
             put("ts", System.currentTimeMillis())
         }
         
-        // AES-GCM Şifreleme (Sadece Python sunucusu veya eşleşmiş cihazlar çözebilir)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, secretKey)
         val encrypted = cipher.doFinal(json.toString().toByteArray())
@@ -220,7 +212,7 @@ class MainActivity : ComponentActivity() {
             addLog("⚠️ Yakında cihaz yok. Paket kuyruğa alındı.")
         } else {
             connectionsClient.sendPayload(discoveredEndpoints.keys.toList(), payload)
-            addLog("🚀 Şifreli SOS Yayınlandı (${discoveredEndpoints.size} düğüme)")
+            addLog("🚀 Şifreli SOS Yayınlandı")
         }
         messageQueue.add(payloadStr)
         tryUplinkToServer()
@@ -228,12 +220,12 @@ class MainActivity : ComponentActivity() {
 
     private fun tryUplinkToServer() {
         if (messageQueue.isEmpty()) return
-        // Basit internet kontrolü
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
         val netInfo = cm.activeNetworkInfo
         if (netInfo != null && netInfo.isConnected) {
             val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO)
             scope.launch {
+                if (messageQueue.isEmpty()) return@launch
                 val msg = messageQueue.removeAt(0)
                 try {
                     val url = URL("http://${serverIp.value}:8000/api/ingest")
@@ -243,10 +235,10 @@ class MainActivity : ComponentActivity() {
                     conn.doOutput = true
                     OutputStreamWriter(conn.outputStream).use { it.write(msg) }
                     if (conn.responseCode == 200) {
-                        withContext(Dispatchers.Main) { addLog("🛰️ Sunucuya Aktarıldı (Uplink)") }
+                        withContext(Dispatchers.Main) { addLog("🛰️ Sunucuya Aktarıldı") }
                     }
                 } catch (e: Exception) {
-                    withContext(Dispatchers.Main) { addLog("❌ Sunucuya Ulaşılamadı: ${e.message}") }
+                    withContext(Dispatchers.Main) { addLog("❌ Sunucu Hatası") }
                 }
             }
         }
@@ -285,7 +277,10 @@ fun AfetNetProApp(
                         label = { Text(title, fontSize = 10.sp) },
                         selected = currentTab == index,
                         onClick = { currentTab = index },
-                        colors = NavigationBarItemDefaults.colors(selectedIcon = Color.Red, unselectedIcon = Color.Gray)
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color.Red,
+                            unselectedIconColor = Color.Gray
+                        )
                     )
                 }
             }
@@ -303,7 +298,7 @@ fun AfetNetProApp(
 
 @Composable
 fun EmergencyScreen(note: String, onNoteChange: (String) -> Unit, needs: List<String>, selected: Set<String>, onNeedToggle: (Set<String>) -> Unit, onSend: (String, List<String>) -> Unit, did: String) {
-    Column(modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
+    Column(modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState())) {
         Text("ACİL DURUM MODU", color = Color.Red, fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Text("Kimlik: $did", color = Color.Gray, fontSize = 12.sp)
         Spacer(Modifier.height(24.dp))
@@ -381,7 +376,7 @@ fun NetworkScreen(logs: List<String>, queueSize: Int) {
 
 @Composable
 fun SettingsScreen(ip: String, onIpChange: (String) -> Unit) {
-    Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState())) {
         Text("Komuta Merkezi Ayarları", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(24.dp))
         Text("Python Sunucusu IP Adresi:", color = Color.Gray)
